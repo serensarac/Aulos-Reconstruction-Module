@@ -1,0 +1,119 @@
+# -*- coding: utf-8 -*-
+"""
+RECONSTRUCTED AULOS – with RAVE v2 Integration
+"""
+
+import numpy as np
+import librosa as li
+import soundfile as sf
+from scipy import signal
+from IPython.display import Audio, display
+from pathlib import Path
+import matplotlib.pyplot as plt
+import pandas as pd
+import torch
+import warnings
+warnings.filterwarnings("ignore")
+
+# Check RAVE v2 availability
+try:
+    from rave.v2 import RAVEModel
+    HAS_RAVE = True
+except ImportError:
+    HAS_RAVE = False
+    print("RAVE v2 not installed. Try: pip install rave-pytorch")
+
+# DORIAN tone base (based on Hagel's research)
+DORIAN_F0 = 370.0  # Hz
+
+# 1. RAVE v2 Handler
+class RaveModelHandler:
+    def __init__(self, model_path=None):
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if HAS_RAVE and model_path:
+            self.load_model(model_path)
+
+    def load_model(self, model_path):
+        try:
+            self.model = RAVEModel.load_from_checkpoint(model_path)
+            self.model.to(self.device).eval()
+            print("✅ RAVE v2 model loaded successfully")
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+
+    def process_audio(self, audio, blend=0.7):
+        if not self.model:
+            return audio
+        try:
+            x = torch.FloatTensor(audio).to(self.device).unsqueeze(0).unsqueeze(0)
+            with torch.no_grad():
+                y = self.model(x)
+            y_np = y.squeeze().cpu().numpy()
+
+            min_len = min(len(audio), len(y_np))
+            audio, y_np = audio[:min_len], y_np[:min_len]
+            fade = np.linspace(0, 1, int(0.1 * min_len))
+            fade_mask = np.ones(min_len)
+            fade_mask[:len(fade)] = fade
+            blended = audio * (1 - blend * fade_mask) + y_np * (blend * fade_mask)
+            return blended / (np.max(np.abs(blended)) + 1e-9) * 0.9
+        except Exception as e:
+            print(f"Error processing audio through RAVE v2: {e}")
+            return audio
+
+# 2. Aulos-like Reed Excitation
+def generate_reed_excitation(duration, sr=44100):
+    t = np.linspace(0, duration, int(sr * duration))
+    reed_noise = np.random.normal(0, 0.3, len(t)) * np.exp(-3.0 * t)
+    air_jet = np.random.uniform(-0.2, 0.2, len(t))
+    reed_vib = 0.5 * np.sin(2 * np.pi * 25 * t + 6 * np.sin(2 * np.pi * 2.0 * t))
+    return (reed_noise * 0.6 + air_jet * 0.2 + reed_vib * 0.2)
+# 3. Resonance Model (basic harmonics)
+def create_resonance(f0, duration, sr=44100):
+    t = np.linspace(0, duration, int(sr * duration))
+    output = np.zeros_like(t)
+    harmonics = [1, 1.5, 2, 2.5, 3, 4]
+    for i, h in enumerate(harmonics):
+        freq = f0 * h
+        decay = np.exp(-t * (0.5 + 0.1 * i))
+        output += np.sin(2 * np.pi * freq * t) * decay * (0.8 - 0.1 * i)
+    return output
+
+# 4. Main Synthesizer
+def synthesize(f0=DORIAN_F0, duration=6, sr=44100, rave_model=None):
+    print(f"\n🎼 Synthesizing Aulos (Dorian, f0 ≈ {f0:.1f} Hz)...")
+    t = np.linspace(0, duration, int(sr * duration))
+    breath = generate_reed_excitation(duration, sr)
+    resonance = create_resonance(f0, duration, sr)
+    pressure = 0.12 * np.sin(2 * np.pi * 1.2 * t)
+    fundamental = np.sin(2 * np.pi * (f0 + 3 * np.sin(2 * np.pi * 0.2 * t)) * t + pressure)
+    raw = 0.4 * breath + 0.6 * (fundamental + resonance)
+
+    # Envelope
+    attack = np.clip(t / 0.08, 0, 1)
+    vibrato = 0.9 + 0.1 * np.sin(2 * np.pi * 0.5 * t)
+    env = attack * vibrato
+    final = raw * env
+    final = final / (np.max(np.abs(final)) + 1e-9) * 0.9
+
+    # RAVE
+    if rave_model:
+        final = rave_model.process_audio(final, blend=0.75)
+
+    return final
+# 5. Save + Display
+def export_audio(audio, sr=44100, filename="aulos_dorian.wav"):
+    sf.write(filename, audio, sr)
+    print(f"\n✅ Output saved: {filename}")
+    display(Audio(audio, rate=sr))
+# 6. RUN
+def main():
+    rave_path = "./rave_v2_model.ckpt"  # Replace with your RAVE v2 model path
+    rave_handler = RaveModelHandler(model_path=rave_path) if HAS_RAVE else None
+
+    audio = synthesize(f0=DORIAN_F0, duration=6, rave_model=rave_handler)
+    export_audio(audio)
+
+if __name__ == "__main__":
+    main()
