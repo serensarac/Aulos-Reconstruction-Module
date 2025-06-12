@@ -1,76 +1,199 @@
-# -*- coding: utf-8 -*-
-"""
-RECONSTRUCTED AULOS – with RAVE v2 Integration
-"""
-
+import os
+import sys
 import numpy as np
 import librosa as li
 import soundfile as sf
-from scipy import signal
-from IPython.display import Audio, display
-from pathlib import Path
 import matplotlib.pyplot as plt
-import pandas as pd
+from pathlib import Path
+from IPython.display import Audio, display
 import torch
-import warnings
-warnings.filterwarnings("ignore")
+import torchaudio
 
-# Check RAVE v2 availability
-try:
-    from rave.v2 import RAVEModel
-    HAS_RAVE = True
-except ImportError:
-    HAS_RAVE = False
-    print("RAVE v2 not installed. Try: pip install rave-pytorch")
+# Constants
+DORIAN_F0 = 440.0  # A4 note as base frequency
+HAS_RAVE = False  # Flag to check if RAVE is available
 
-# DORIAN tone base (based on Hagel's research)
-DORIAN_F0 = 370.0  # Hz
-
-# 1. RAVE v2 Handler
 class RaveModelHandler:
-    def __init__(self, model_path=None):
+    def __init__(self, model_path):
+        self.model_path = model_path
         self.model = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if HAS_RAVE and model_path:
-            self.load_model(model_path)
-
-    def load_model(self, model_path):
         try:
-            self.model = RAVEModel.load_from_checkpoint(model_path)
-            self.model.to(self.device).eval()
-            print("✅ RAVE v2 model loaded successfully")
-        except Exception as e:
-            print(f"❌ Error loading model: {e}")
-
-    def process_audio(self, audio, blend=0.7):
-        if not self.model:
+            # Attempt to load RAVE model if available
+            from rave import RAVE
+            self.model = RAVE.load_from_checkpoint(model_path)
+            self.model.eval()
+            HAS_RAVE = True
+        except:
+            print("RAVE model not available, continuing without neural synthesis")
+    
+    def process_audio(self, audio, blend=0.75):
+        if self.model is None:
             return audio
         try:
-            x = torch.FloatTensor(audio).to(self.device).unsqueeze(0).unsqueeze(0)
+            # Convert audio to tensor and process
+            audio_tensor = torch.from_numpy(audio).float()
             with torch.no_grad():
-                y = self.model(x)
-            y_np = y.squeeze().cpu().numpy()
-
-            min_len = min(len(audio), len(y_np))
-            audio, y_np = audio[:min_len], y_np[:min_len]
-            fade = np.linspace(0, 1, int(0.1 * min_len))
-            fade_mask = np.ones(min_len)
-            fade_mask[:len(fade)] = fade
-            blended = audio * (1 - blend * fade_mask) + y_np * (blend * fade_mask)
-            return blended / (np.max(np.abs(blended)) + 1e-9) * 0.9
-        except Exception as e:
-            print(f"Error processing audio through RAVE v2: {e}")
+                processed = self.model(audio_tensor)
+            return processed.numpy() * blend + audio * (1 - blend)
+        except:
             return audio
 
-# 2. Aulos-like Reed Excitation
+# Dataset configuration
+DATASET_PATH = "s/Users/musicvan/aulos/my_aulos_data"
+
+def load_audio_dataset(dataset_path=DATASET_PATH):
+    """
+    Load and analyze your AULOS audio dataset
+    Supports: .wav, .mp3, .flac, .aiff, .m4a
+    """
+    dataset_path = Path(dataset_path)
+    
+    if not dataset_path.exists():
+        print(f"⚠️ Dataset path not found: {dataset_path}")
+        print("📁 Creating directory structure...")
+        dataset_path.mkdir(parents=True, exist_ok=True)
+        print(f"✅ Created: {dataset_path}")
+        print("   Please upload your audio files to this directory")
+        return [], {}
+    
+    # Supported audio formats
+    audio_extensions = ['.wav', '.mp3', '.flac', '.aiff', '.m4a', '.ogg']
+    
+    # Find all audio files
+    audio_files = []
+    for ext in audio_extensions:
+        audio_files.extend(list(dataset_path.glob(f"*{ext}")))
+        audio_files.extend(list(dataset_path.glob(f"**/*{ext}")))  # Recursive search
+    
+    if not audio_files:
+        print(f"❌ No audio files found in {dataset_path}")
+        print(f"   Supported formats: {', '.join(audio_extensions)}")
+        return [], {}
+    
+    print(f"📊 Found {len(audio_files)} audio files:")
+    
+    # Load and analyze each file
+    dataset_info = {}
+    loaded_audio = []
+    
+    for i, file_path in enumerate(audio_files):
+        try:
+            print(f"   Loading {i+1}/{len(audio_files)}: {file_path.name}")
+            
+            # Load audio
+            audio, sr = li.load(str(file_path), sr=None)
+            
+            # Basic analysis
+            duration = len(audio) / sr
+            rms = np.sqrt(np.mean(audio**2))
+            
+            # Pitch detection
+            pitches, magnitudes = li.piptrack(y=audio, sr=sr, threshold=0.1)
+            pitch_estimates = []
+            for t in range(pitches.shape[1]):
+                index = magnitudes[:, t].argmax()
+                pitch = pitches[index, t]
+                if pitch > 0:
+                    pitch_estimates.append(pitch)
+            
+            fundamental_freq = np.median(pitch_estimates) if pitch_estimates else 0
+            
+            # Store info
+            file_info = {
+                'path': str(file_path),
+                'filename': file_path.name,
+                'audio': audio,
+                'sample_rate': sr,
+                'duration': duration,
+                'rms': rms,
+                'fundamental_freq': fundamental_freq,
+                'pitch_estimates': pitch_estimates
+            }
+            
+            dataset_info[file_path.stem] = file_info
+            loaded_audio.append((file_path.stem, audio, sr))
+            
+            print(f"      Duration: {duration:.2f}s, F0: {fundamental_freq:.1f}Hz, RMS: {rms:.3f}")
+            
+        except Exception as e:
+            print(f"   ❌ Error loading {file_path.name}: {e}")
+    
+    print(f"\n✅ Successfully loaded {len(loaded_audio)} audio files")
+    return loaded_audio, dataset_info
+
+def analyze_dataset(dataset_info):
+    """Analyze the loaded dataset and create visualizations"""
+    if not dataset_info:
+        print("No dataset to analyze")
+        return
+    
+    # Extract statistics
+    durations = [info['duration'] for info in dataset_info.values()]
+    fundamentals = [info['fundamental_freq'] for info in dataset_info.values() if info['fundamental_freq'] > 0]
+    rms_values = [info['rms'] for info in dataset_info.values()]
+    
+    # Create analysis plots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Duration distribution
+    axes[0,0].hist(durations, bins=10, alpha=0.7, color='skyblue')
+    axes[0,0].set_title('Audio Duration Distribution')
+    axes[0,0].set_xlabel('Duration (seconds)')
+    axes[0,0].set_ylabel('Count')
+    axes[0,0].grid(True, alpha=0.3)
+    
+    # Fundamental frequency distribution
+    if fundamentals:
+        axes[0,1].hist(fundamentals, bins=15, alpha=0.7, color='lightgreen')
+        axes[0,1].set_title('Fundamental Frequency Distribution')
+        axes[0,1].set_xlabel('Frequency (Hz)')
+        axes[0,1].set_ylabel('Count')
+        axes[0,1].grid(True, alpha=0.3)
+    else:
+        axes[0,1].text(0.5, 0.5, 'No pitch data available', ha='center', va='center', transform=axes[0,1].transAxes)
+        axes[0,1].set_title('Fundamental Frequency Distribution')
+    
+    # RMS (volume) distribution
+    axes[1,0].hist(rms_values, bins=12, alpha=0.7, color='salmon')
+    axes[1,0].set_title('RMS (Volume) Distribution')
+    axes[1,0].set_xlabel('RMS Value')
+    axes[1,0].set_ylabel('Count')
+    axes[1,0].grid(True, alpha=0.3)
+    
+    # Dataset summary table
+    axes[1,1].axis('off')
+    summary_text = f"""
+Dataset Summary:
+• Total Files: {len(dataset_info)}
+• Avg Duration: {np.mean(durations):.2f}s
+• Duration Range: {np.min(durations):.1f}s - {np.max(durations):.1f}s
+• Avg F0: {np.mean(fundamentals):.1f}Hz (if detected)
+• F0 Range: {np.min(fundamentals):.1f}Hz - {np.max(fundamentals):.1f}Hz
+• Avg RMS: {np.mean(rms_values):.3f}
+• RMS Range: {np.min(rms_values):.3f} - {np.max(rms_values):.3f}
+"""
+    axes[1,1].text(0.1, 0.9, summary_text, transform=axes[1,1].transAxes, 
+                   fontsize=11, verticalalignment='top', fontfamily='monospace')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'durations': durations,
+        'fundamentals': fundamentals, 
+        'rms_values': rms_values
+    }
+
 def generate_reed_excitation(duration, sr=44100):
+    """Generate reed excitation signal"""
     t = np.linspace(0, duration, int(sr * duration))
     reed_noise = np.random.normal(0, 0.3, len(t)) * np.exp(-3.0 * t)
     air_jet = np.random.uniform(-0.2, 0.2, len(t))
     reed_vib = 0.5 * np.sin(2 * np.pi * 25 * t + 6 * np.sin(2 * np.pi * 2.0 * t))
     return (reed_noise * 0.6 + air_jet * 0.2 + reed_vib * 0.2)
-# 3. Resonance Model (basic harmonics)
+
 def create_resonance(f0, duration, sr=44100):
+    """Create resonance model with harmonics"""
     t = np.linspace(0, duration, int(sr * duration))
     output = np.zeros_like(t)
     harmonics = [1, 1.5, 2, 2.5, 3, 4]
@@ -80,8 +203,8 @@ def create_resonance(f0, duration, sr=44100):
         output += np.sin(2 * np.pi * freq * t) * decay * (0.8 - 0.1 * i)
     return output
 
-# 4. Main Synthesizer
 def synthesize(f0=DORIAN_F0, duration=6, sr=44100, rave_model=None):
+    """Main synthesis function"""
     print(f"\n🎼 Synthesizing Aulos (Dorian, f0 ≈ {f0:.1f} Hz)...")
     t = np.linspace(0, duration, int(sr * duration))
     breath = generate_reed_excitation(duration, sr)
@@ -97,23 +220,34 @@ def synthesize(f0=DORIAN_F0, duration=6, sr=44100, rave_model=None):
     final = raw * env
     final = final / (np.max(np.abs(final)) + 1e-9) * 0.9
 
-    # RAVE
+    # RAVE processing if available
     if rave_model:
         final = rave_model.process_audio(final, blend=0.75)
 
     return final
-# 5. Save + Display
+
 def export_audio(audio, sr=44100, filename="aulos_dorian.wav"):
+    """Export audio to file"""
     sf.write(filename, audio, sr)
     print(f"\n✅ Output saved: {filename}")
-    display(Audio(audio, rate=sr))
-# 6. RUN
-def main():
-    rave_path = "./rave_v2_model.ckpt"  # Replace with your RAVE v2 model path
-    rave_handler = RaveModelHandler(model_path=rave_path) if HAS_RAVE else None
+    if 'IPython' in sys.modules:
+        display(Audio(audio, rate=sr))
 
+def main():
+    """Main function to run the synthesis"""
+    # Create output directory if it doesn't exist
+    os.makedirs("output", exist_ok=True)
+    
+    # Load the aulos dataset
+    loaded_audio, dataset_info = load_audio_dataset()
+    
+    # Initialize RAVE if available
+    rave_path = "./rave_v2_model.ckpt"
+    rave_handler = RaveModelHandler(model_path=rave_path) if os.path.exists(rave_path) else None
+
+    # Generate and export audio using RAVE if available
     audio = synthesize(f0=DORIAN_F0, duration=6, rave_model=rave_handler)
-    export_audio(audio)
+    export_audio(audio, filename="output/aulos_dorian.wav")
 
 if __name__ == "__main__":
     main()
